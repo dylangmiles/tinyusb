@@ -121,6 +121,26 @@ static bool cp210x_set_modem_ctrl(cdch_interface_t* p_cdc, uint16_t line_state, 
 static bool cp210x_set_baudrate(cdch_interface_t* p_cdc, uint32_t baudrate, tuh_xfer_cb_t complete_cb, uintptr_t user_data);
 #endif
 
+//------------- CH34X prototypes -------------//
+#if CFG_TUH_CDC_CH34X
+#include "serial/ch34x.h"
+
+static uint16_t const ch34x_pids[] = { TU_CH34X_PID_LIST };
+enum {
+    CH34X_PID_COUNT = sizeof(ch34x_pids) / sizeof(ch34x_pids[0])
+};
+
+// Store last request baudrate since divisor to baudrate is not easy
+static uint32_t _ch34x_requested_baud;
+static uint16_t _ch34x_chip_version;
+
+static bool ch34x_open(uint8_t daddr, const tusb_desc_interface_t *itf_desc, uint16_t max_len);
+static void ch34x_process_config(tuh_xfer_t* xfer);
+
+static bool ch34x_set_modem_ctrl(cdch_interface_t* p_cdc, uint16_t line_state, tuh_xfer_cb_t complete_cb, uintptr_t user_data);
+static bool ch34x_set_baudrate(cdch_interface_t* p_cdc, uint32_t baudrate, tuh_xfer_cb_t complete_cb, uintptr_t user_data);
+#endif
+
 enum {
   SERIAL_DRIVER_ACM = 0,
 
@@ -131,6 +151,11 @@ enum {
 #if CFG_TUH_CDC_CP210X
   SERIAL_DRIVER_CP210X,
 #endif
+
+#if CFG_TUH_CDC_CH34X
+  SERIAL_DRIVER_CH34X,
+#endif
+
 };
 
 typedef struct {
@@ -159,6 +184,14 @@ static const cdch_serial_driver_t serial_drivers[] = {
     .set_baudrate           = cp210x_set_baudrate
   },
   #endif
+
+  #if CFG_TUH_CDC_CH34X
+  { .process_set_config     = ch34x_process_config,
+    .set_control_line_state = ch34x_set_modem_ctrl,
+    .set_baudrate           = ch34x_set_baudrate
+  },
+  #endif
+
 };
 
 enum {
@@ -426,6 +459,27 @@ static void cdch_internal_control_complete(tuh_xfer_t* xfer)
         break;
       #endif
 
+      #if CFG_TUH_CDC_CH34X
+        case SERIAL_DRIVER_CH34X:
+            switch (xfer->setup->bRequest) {
+                case CH34X_REQ_READ_VERSION:
+                    // Process version number
+                    memcpy(&_ch34x_chip_version, xfer->buffer, sizeof(uint16_t));
+                    break;
+//                case CH34X_MODEM_CTRL:
+//                    p_cdc->line_state = (uint8_t) (tu_le16toh(xfer->setup->wValue) & 0x00ff);
+//                    break;
+//
+//                case CH34X_SET_BAUD_RATE:
+//                    // convert from divisor to baudrate is not supported
+//                    p_cdc->line_coding.bit_rate = _ch34x_requested_baud;
+//                    break;
+
+                default: break;
+            }
+            break;
+    #endif
+
       default: break;
     }
   }
@@ -665,6 +719,16 @@ bool cdch_open(uint8_t rhport, uint8_t daddr, tusb_desc_interface_t const *itf_d
         }
       }
     }
+    #endif
+
+    #if CFG_TUH_CDC_CH34X
+            if (TU_CH34X_VID == vid) {
+                for (size_t i = 0; i < CH34X_PID_COUNT; i++) {
+                    if (ch34x_pids[i] == pid) {
+                        return ch34x_open(daddr, itf_desc, max_len);
+                    }
+                }
+            }
     #endif
   }
   #endif
@@ -1172,6 +1236,298 @@ static void cp210x_process_config(tuh_xfer_t* xfer) {
 
     default: break;
   }
+}
+
+#endif
+
+
+//--------------------------------------------------------------------+
+// CH34X
+//--------------------------------------------------------------------+
+#if CFG_TUH_CDC_CH34X
+
+enum {
+    CONFIG_CH34X_GET_VERSION = 0,
+    CONFIG_CH34X_INIT,
+    CONFIG_CH34X_MODEM_CTRL,
+    CONFIG_CH34X_SET_BAUDRATE,
+    CONFIG_CH34X_SET_DATA,
+    CONFIG_CH34X_COMPLETE
+};
+
+static bool ch34x_open(uint8_t daddr, const tusb_desc_interface_t *itf_desc, uint16_t max_len) {
+    // FTDI Interface includes 1 vendor interface + 2 bulk endpoints
+    TU_VERIFY(itf_desc->bInterfaceSubClass == 0x01 && itf_desc->bInterfaceProtocol == 0x02 && itf_desc->bNumEndpoints == 3);
+    TU_VERIFY(sizeof(tusb_desc_interface_t) + 2*sizeof(tusb_desc_endpoint_t) <= max_len);
+
+    cdch_interface_t * p_cdc = make_new_itf(daddr, itf_desc);
+    TU_VERIFY(p_cdc);
+
+    TU_LOG_DRV("FTDI opened\r\n");
+
+    p_cdc->serial_drid = SERIAL_DRIVER_CH34X;
+
+    // endpoint pair
+    tusb_desc_endpoint_t const * desc_ep = (tusb_desc_endpoint_t const *) tu_desc_next(itf_desc);
+
+    // data endpoints expected to be in pairs
+    return open_ep_stream_pair(p_cdc, desc_ep);
+}
+
+// set request without data
+static bool ch34x_set_request(cdch_interface_t* p_cdc, uint8_t command, uint16_t value, uint16_t index, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+    tusb_control_request_t const request = {
+            .bmRequestType_bit = {
+                    .recipient = TUSB_REQ_RCPT_DEVICE,
+                    .type      = TUSB_REQ_TYPE_VENDOR,
+                    .direction = TUSB_DIR_OUT
+            },
+            .bRequest = command,
+            .wValue   = tu_htole16(value),
+            .wIndex   = tu_htole16(index),
+            .wLength  = 0
+    };
+
+    tuh_xfer_t xfer = {
+            .daddr       = p_cdc->daddr,
+            .ep_addr     = 0,
+            .setup       = &request,
+            .buffer      = NULL,
+            .complete_cb = complete_cb,
+            .user_data   = user_data
+    };
+
+    return tuh_control_xfer(&xfer);
+}
+
+// get request without data
+static bool ch34x_get_request(cdch_interface_t* p_cdc, uint8_t command, uint16_t value, int8_t* buffer, uint16_t length, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+    tusb_control_request_t const request = {
+            .bmRequestType_bit = {
+                    .recipient = TUSB_REQ_RCPT_DEVICE,
+                    .type      = TUSB_REQ_TYPE_VENDOR,
+                    .direction = TUSB_DIR_IN
+            },
+            .bRequest = command,
+            .wValue   = tu_htole16(value),
+            .wIndex   = 0,
+            .wLength  = tu_htole16(length)
+    };
+
+    tuh_xfer_t xfer = {
+            .daddr       = p_cdc->daddr,
+            .ep_addr     = 0,
+            .setup       = &request,
+            .buffer      = buffer,
+            .complete_cb = complete_cb,
+            .user_data   = user_data
+    };
+
+    return tuh_control_xfer(&xfer);
+}
+
+// Buffer to retrieve chip version
+static uint16_t _ch34x_chip_version_buffer_size = 0x2;
+static uint8_t _ch34x_chip_version_buffer[0x2];
+
+static bool ch34x_get_version(cdch_interface_t* p_cdc, tuh_xfer_cb_t complete_cb, uintptr_t user_data) {
+    p_cdc->user_control_cb = complete_cb;
+    return ch34x_get_request(p_cdc, CH34X_REQ_READ_VERSION, 0x0, _ch34x_chip_version_buffer, _ch34x_chip_version_buffer_size, complete_cb ? cdch_internal_control_complete : NULL, user_data);
+}
+
+static bool ch34x_init(cdch_interface_t* p_cdc, tuh_xfer_cb_t complete_cb, uintptr_t user_data)
+{
+    return ch34x_set_request(p_cdc, CH34X_REQ_SERIAL_INIT, 0x0, 0x0, complete_cb, user_data);
+}
+
+static bool ch34x_set_modem_ctrl(cdch_interface_t* p_cdc, uint16_t line_state, tuh_xfer_cb_t complete_cb, uintptr_t user_data)
+{
+    TU_LOG_DRV("CDC FTDI Set Control Line State\r\n");
+//    p_cdc->user_control_cb = complete_cb;
+//    TU_ASSERT(ch34x_set_request(p_cdc, CH34X_MODEM_CTRL, 0x0300 | line_state,
+//                                   complete_cb ? cdch_internal_control_complete : NULL, user_data));
+    return true;
+}
+
+
+#define CH341_CLKRATE		48000000
+#define CH341_CLK_DIV(ps, fact)	(1 << (12 - 3 * (ps) - (fact)))
+#define CH341_MIN_RATE(ps)	(CH341_CLKRATE / (CH341_CLK_DIV((ps), 1) * 512))
+
+static const uint32_t ch341_min_rates[] = {
+        CH341_MIN_RATE(0),
+        CH341_MIN_RATE(1),
+        CH341_MIN_RATE(2),
+        CH341_MIN_RATE(3),
+};
+
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+
+/* Supported range is 46 to 3000000 bps. */
+#define CH341_MIN_BPS	DIV_ROUND_UP(CH341_CLKRATE, CH341_CLK_DIV(0, 0) * 256)
+#define CH341_MAX_BPS	(CH341_CLKRATE / (CH341_CLK_DIV(3, 0) * 2))
+
+/*
+ * Useful when min and max are constants.
+ */
+#define clamp_val(val, min, max) ({ \
+ typeof(val) __val = (val); \
+ typeof(val) __min = (min); \
+ typeof(val) __max = (max); \
+ __val = __val < __min ? __min: __val; \
+ __val > __max ? __max: __val; })
+
+/*
+ * The device line speed is given by the following equation:
+ *
+ *	baudrate = 48000000 / (2^(12 - 3 * ps - fact) * div), where
+ *
+ *		0 <= ps <= 3,
+ *		0 <= fact <= 1,
+ *		2 <= div <= 256 if fact = 0, or
+ *		9 <= div <= 256 if fact = 1
+ */
+static uint32_t ch341_get_divisor(uint32_t baudrate, bool quirk_limited_prescaler)
+{
+    unsigned int fact, div, clk_div;
+    bool force_fact0 = false;
+    int ps;
+
+    /*
+     * Clamp to supported range, this makes the (ps < 0) and (div < 2)
+     * sanity checks below redundant.
+     */
+    baudrate = clamp_val(baudrate, CH341_MIN_BPS, CH341_MAX_BPS);
+
+    /*
+     * Start with highest possible base clock (fact = 1) that will give a
+     * divisor strictly less than 512.
+     */
+    fact = 1;
+    for (ps = 3; ps >= 0; ps--) {
+        if (baudrate > ch341_min_rates[ps])
+            break;
+    }
+
+    TU_ASSERT(ps > 0);
+
+    /* Determine corresponding divisor, rounding down. */
+    clk_div = CH341_CLK_DIV(ps, fact);
+    div = CH341_CLKRATE / (clk_div * baudrate);
+
+    /* Some devices require a lower base clock if ps < 3. */
+    if (ps < 3 && (quirk_limited_prescaler))
+        force_fact0 = true;
+
+    /* Halve base clock (fact = 0) if required. */
+    if (div < 9 || div > 255 || force_fact0) {
+        div /= 2;
+        clk_div *= 2;
+        fact = 0;
+    }
+
+    TU_ASSERT(div >= 2);
+
+    /*
+     * Pick next divisor if resulting rate is closer to the requested one,
+     * scale up to avoid rounding errors on low rates.
+     */
+    if (16 * CH341_CLKRATE / (clk_div * div) - 16 * baudrate >=
+        16 * baudrate - 16 * CH341_CLKRATE / (clk_div * (div + 1)))
+        div++;
+
+    /*
+     * Prefer lower base clock (fact = 0) if even divisor.
+     *
+     * Note that this makes the receiver more tolerant to errors.
+     */
+    if (fact == 1 && div % 2 == 0) {
+        div /= 2;
+        fact = 0;
+    }
+
+    return (0x100 - div) << 8 | fact << 2 | ps;
+}
+
+
+static bool ch34x_set_baudrate(cdch_interface_t* p_cdc, uint32_t baudrate, tuh_xfer_cb_t complete_cb, uintptr_t user_data)
+{
+
+    // TODO: Quirks for limited prescaler
+    bool limited_pre_scaler = false;
+    uint32_t divisor = ch341_get_divisor(baudrate, limited_pre_scaler);
+    TU_LOG_DRV("CDC CH32X Set BaudRate = %lu, divisor = 0x%04x\r\n", baudrate, divisor);
+
+    /*
+	 * CH341A buffers data until a full endpoint-size packet (32 bytes)
+	 * has been received unless bit 7 is set.
+	 *
+	 * At least one device with version 0x27 appears to have this bit
+	 * inverted.
+	 */
+    if(_ch34x_chip_version > 0x27) {
+        divisor |= 1 << 7;
+    }
+
+
+    ch34x_set_request(p_cdc, CH34X_REQ_WRITE_REG, CH34X_REG_DIVISOR << 8 | CH34X_REG_PRESCALER, divisor, complete_cb ? cdch_internal_control_complete : NULL, user_data);
+
+    // Get the version
+
+//    uint16_t const divisor = (uint16_t) ch34x_232bm_baud_to_divisor(baudrate);
+//    TU_LOG_DRV("CDC FTDI Set BaudRate = %lu, divisor = 0x%04x\r\n", baudrate, divisor);
+//
+//    p_cdc->user_control_cb = complete_cb;
+//    _ch34x_requested_baud = baudrate;
+//    TU_ASSERT(ch34x_set_request(p_cdc, CH34X_SET_BAUD_RATE, divisor,
+//                                   complete_cb ? cdch_internal_control_complete : NULL, user_data));
+
+    return true;
+}
+
+static void ch34x_process_config(tuh_xfer_t* xfer) {
+    uintptr_t const state = xfer->user_data;
+    uint8_t const itf_num = (uint8_t) tu_le16toh(xfer->setup->wIndex);
+    uint8_t const idx = tuh_cdc_itf_get_index(xfer->daddr, itf_num);
+    cdch_interface_t * p_cdc = get_itf(idx);
+    TU_ASSERT(p_cdc, );
+
+    switch(state) {
+        case CONFIG_CH34X_GET_VERSION:
+            TU_ASSERT(ch34x_get_version(p_cdc, ch34x_process_config, CONFIG_CH34X_INIT),);
+            break;
+        case CONFIG_CH34X_INIT:
+            TU_ASSERT(ch34x_init(p_cdc, ch34x_process_config, CONFIG_CH34X_MODEM_CTRL),);
+            break;
+
+        case CONFIG_CH34X_MODEM_CTRL:
+#if CFG_TUH_CDC_LINE_CONTROL_ON_ENUM
+            TU_ASSERT(
+                    ch34x_set_modem_ctrl(p_cdc, CFG_TUH_CDC_LINE_CONTROL_ON_ENUM, ch34x_process_config, CONFIG_CH34X_SET_BAUDRATE),);
+            break;
+#else
+            TU_ATTR_FALLTHROUGH;
+#endif
+
+        case CONFIG_CH34X_SET_BAUDRATE: {
+#ifdef CFG_TUH_CDC_LINE_CODING_ON_ENUM
+            cdc_line_coding_t line_coding = CFG_TUH_CDC_LINE_CODING_ON_ENUM;
+            TU_ASSERT(ch34x_set_baudrate(p_cdc, line_coding.bit_rate, ch34x_process_config, CONFIG_CH34X_COMPLETE),);
+            break;
+#else
+            TU_ATTR_FALLTHROUGH;
+#endif
+        }
+
+
+
+        case CONFIG_CH34X_COMPLETE:
+            set_config_complete(p_cdc, idx, itf_num);
+            break;
+
+        default:
+            break;
+    }
 }
 
 #endif
