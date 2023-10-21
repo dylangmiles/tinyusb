@@ -60,4 +60,11 @@
 #define CH341_QUIRK_LIMITED_PRESCALER	BIT(0)
 #define CH341_QUIRK_SIMULATE_BREAK	BIT(1)
 
+#define CH34X_DEFAULT_BAUD_RATE 9600
+#define CH34X_DEFAULT_TIMEOUT   1000
+
+/* flags for IO-Bits */
+#define CH34X_BIT_RTS (1 << 6)
+#define CH34X_BIT_DTR (1 << 5)
+
 #endif //TUSB_CH34X_H
